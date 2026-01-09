@@ -1,4 +1,4 @@
-package ru.zolotuhin.ParrerelMethods.Lab6;
+package ru.zolotuhin.ParrerelMethods.Lab8;
 
 import javax.swing.*;
 import java.awt.*;
@@ -10,6 +10,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ParkingSpot extends JPanel implements Runnable {
     private Thread thread;
+    private Thread consumerThread;
+    private Thread heartbeatThread;
     private final AtomicBoolean systemRunning;
     private Random random;
 
@@ -17,10 +19,12 @@ public class ParkingSpot extends JPanel implements Runnable {
     private JLabel distanceLabel;
     private JLabel statusLabel;
     private JLabel guidanceStatusLabel;
-    private JTextField incomingCommandField;
     private JProgressBar distanceBar;
     private JProgressBar guidanceProgressBar;
     private JTextArea logArea;
+    private JTextArea incomingQueueDisplay;
+    private JTextArea outgoingQueueDisplay;
+    private JLabel queueStatsLabel;
     private JButton generateSpotButton;
     private JButton confirmParkingButton;
 
@@ -30,19 +34,29 @@ public class ParkingSpot extends JPanel implements Runnable {
     private boolean guidanceActive = false;
     private boolean spotGenerated = false;
     private SimpleDateFormat timeFormat;
+    private int messagesSent = 0;
+    private int messagesReceived = 0;
 
     private static final double MIN_DISTANCE = 20.0;
     private static final double MAX_DISTANCE = 90.0;
-    private static final double GUIDANCE_RANGE = 15.0; // метров для точного позиционирования
+    private static final double GUIDANCE_RANGE = 15.0;
 
     public ParkingSpot(AtomicBoolean systemRunning) {
         this.systemRunning = systemRunning;
         this.random = new Random();
         this.timeFormat = new SimpleDateFormat("HH:mm:ss");
 
-        initializeGUI();
+        // Регистрируем компонент через SocketUtils
+        SocketUtils.registerComponent("ParkingSpot");
 
-        SocketUtils.startServer(5003, this::handleIncomingMessage);
+        initializeGUI();
+        startConsumer();
+        startHeartbeat();
+
+        // Отправляем сообщение о запуске
+        sendStatusMessage("ParkingSpot: запущен");
+
+        SocketUtils.startServer(5003, this::handleSocketMessage);
     }
 
     public static void main(String[] args) {
@@ -55,13 +69,15 @@ public class ParkingSpot extends JPanel implements Runnable {
             ParkingSpot parkingSpot = new ParkingSpot(systemRunning);
 
             JPanel controlPanel = new JPanel(new FlowLayout());
-            controlPanel.setBorder(BorderFactory.createTitledBorder("Управление парковочным местом"));
+            controlPanel.setBorder(BorderFactory.createTitledBorder("Управление парковочным местом (Hybrid)"));
 
             JButton startButton = new JButton("Запуск системы");
             JButton stopButton = new JButton("Остановка системы");
             JButton generateButton = new JButton("Сгенерировать место");
             JButton resetButton = new JButton("Сбросить парковку");
             JButton testGuidanceButton = new JButton("Тест наведения");
+            JButton testProducerButton = new JButton("Тест Producer");
+            JButton testConsumerButton = new JButton("Тест Consumer");
 
             startButton.addActionListener(e -> {
                 parkingSpot.start();
@@ -88,22 +104,74 @@ public class ParkingSpot extends JPanel implements Runnable {
                 parkingSpot.logMessage("Тестирование системы наведения");
             });
 
+            testProducerButton.addActionListener(e -> {
+                parkingSpot.testProducer();
+                parkingSpot.logMessage("Тестирование Producer");
+            });
+
+            testConsumerButton.addActionListener(e -> {
+                parkingSpot.testConsumer();
+                parkingSpot.logMessage("Тестирование Consumer");
+            });
+
             controlPanel.add(startButton);
             controlPanel.add(stopButton);
             controlPanel.add(generateButton);
             controlPanel.add(resetButton);
             controlPanel.add(testGuidanceButton);
+            controlPanel.add(testProducerButton);
+            controlPanel.add(testConsumerButton);
 
             frame.add(controlPanel, BorderLayout.NORTH);
             frame.add(parkingSpot, BorderLayout.CENTER);
 
-            frame.setSize(800, 700);
+            frame.setSize(1300, 850);
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
 
             parkingSpot.start();
             parkingSpot.generateNewSpot();
         });
+    }
+
+    private void startConsumer() {
+        consumerThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                // Получаем сообщения через SocketUtils
+                Message message = SocketUtils.receiveMessageViaMQ("ParkingSpot");
+
+                if (message != null) {
+                    messagesReceived++;
+                    processMessage(message);
+                    updateQueueStats();
+                    updateIncomingQueueDisplay(message);
+                }
+            }
+        }, "ParkingSpot-Consumer");
+        consumerThread.start();
+    }
+
+    private void startHeartbeat() {
+        heartbeatThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                try {
+                    sendHeartbeat();
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "ParkingSpot-Heartbeat");
+        heartbeatThread.start();
+    }
+
+    private void sendHeartbeat() {
+        SocketUtils.sendMessageViaMQ("StatusWindow", "ParkingSpot", "HEARTBEAT", MessageType.HEARTBEAT);
+    }
+
+    private void sendStatusMessage(String content) {
+        SocketUtils.sendMessageViaMQ("StatusWindow", "ParkingSpot", content, MessageType.STATUS);
     }
 
     public void start() {
@@ -121,17 +189,16 @@ public class ParkingSpot extends JPanel implements Runnable {
         if (thread != null) {
             thread.interrupt();
         }
+        if (consumerThread != null) {
+            consumerThread.interrupt();
+        }
         updateGuidanceStatus("Система остановлена", Color.RED);
         logMessage("Система парковочного места остановлена");
     }
 
-    public boolean isAlive() {
-        return thread != null && thread.isAlive();
-    }
-
     @Override
     public void run() {
-        logMessage("Модуль парковочного места запущен и готов к работе");
+        logMessage("Модуль парковочного места запущен (Hybrid)");
 
         while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
             try {
@@ -149,36 +216,68 @@ public class ParkingSpot extends JPanel implements Runnable {
         updateGuidanceStatus("Система остановлена", Color.RED);
     }
 
-    private void handleIncomingMessage(String message) {
-        updateIncomingCommand(message);
-        logMessage("Получена команда: " + message);
+    private void handleSocketMessage(String rawMessage) {
+        // Помещаем сообщение в свою очередь через SocketUtils
+        SocketUtils.sendMessageViaMQ("ParkingSpot", "Socket", rawMessage, MessageType.COMMAND);
+        logMessage("Сообщение из сокета помещено в очередь: " + rawMessage);
+    }
+
+    private void processMessage(Message message) {
+        String content = message.getContent();
+        String from = message.getFrom();
+
+        logMessage("Обработка сообщения от " + from + ": " + content);
 
         try {
-            if (message.startsWith("REDUCE_DISTANCE:")) {
-                String distanceStr = message.substring(16).replace(',', '.');
+            if (content.startsWith("REDUCE_DISTANCE:")) {
+                String distanceStr = content.substring(16).replace(',', '.');
                 double reduction = Double.parseDouble(distanceStr);
                 reduceDistance(reduction);
 
-            } else if ("PROVIDE_GUIDANCE".equals(message)) {
+            } else if ("PROVIDE_GUIDANCE".equals(content)) {
                 provideGuidance();
 
-            } else if ("CONFIRM_PARKING".equals(message)) {
+            } else if ("CONFIRM_PARKING".equals(content)) {
                 confirmParking();
 
-            } else if ("GET_SPOT_INFO".equals(message)) {
+            } else if ("GET_SPOT_INFO".equals(content)) {
                 sendSpotInfoToAutopilot();
 
-            } else if ("RESET_SPOT".equals(message)) {
+            } else if ("RESET_SPOT".equals(content)) {
                 resetParking();
 
-            } else if ("EMERGENCY_STOP".equals(message)) {
+            } else if ("EMERGENCY_STOP".equals(content)) {
                 handleEmergencyStop();
-            }
 
+            } else if ("STOP".equals(content)) {
+                logMessage("Получена команда STOP");
+                updateGuidanceStatus("Остановка", Color.ORANGE);
+
+            } else if ("NEW_SPOT_DETECTED".equals(content)) {
+                logMessage("Камера обнаружила новое парковочное место");
+                if (!spotGenerated) {
+                    generateNewSpot();
+                }
+            }
         } catch (NumberFormatException e) {
-            logMessage("ОШИБКА: Неверный формат расстояния в команде: " + message);
+            logMessage("ОШИБКА: Неверный формат расстояния в команде: " + content);
         } catch (Exception e) {
             logMessage("ОШИБКА обработки команды: " + e.getMessage());
+        }
+    }
+
+    private void produceMessage(String target, String content, MessageType type) {
+        // Используем SocketUtils вместо MessageQueueManager
+        boolean success = SocketUtils.sendMessageViaMQ(target, "ParkingSpot", content, type);
+
+        if (success) {
+            messagesSent++;
+            updateQueueStats();
+            Message message = new Message("ParkingSpot", content, type);
+            updateOutgoingQueueDisplay(message, target);
+            logMessage("Сообщение отправлено в " + target + ": " + content);
+        } else {
+            logMessage("ОШИБКА: очередь " + target + " переполнена или нет связи с сервером!");
         }
     }
 
@@ -198,8 +297,8 @@ public class ParkingSpot extends JPanel implements Runnable {
         spotGenerated = true;
 
         String spotType = types[random.nextInt(types.length)];
-        double spotWidth = 2.0 + random.nextDouble() * 0.5; // 2.0 - 2.5 метра
-        double spotLength = 4.5 + random.nextDouble() * 0.5; // 4.5 - 5.0 метра
+        double spotWidth = 2.0 + random.nextDouble() * 0.5;
+        double spotLength = 4.5 + random.nextDouble() * 0.5;
 
         updateSpotInfo();
 
@@ -219,12 +318,11 @@ public class ParkingSpot extends JPanel implements Runnable {
     }
 
     private void sendSpotInfoToAutopilot() {
-        if (SocketUtils.isPortAvailable("localhost", 5001)) {
+        if (spotNumber != null) {
             String spotMessage = "SPOT:" + spotNumber + ":" + String.format(Locale.US, "%.1f", distance);
-            SocketUtils.sendMessage("localhost", 5001, spotMessage);
-            logMessage("Информация о месте отправлена автопилоту");
-        } else {
-            logMessage("Автопилот не доступен для отправки информации о месте");
+            produceMessage("Autopilot", spotMessage, MessageType.DATA);
+            produceMessage("StatusWindow", "ParkingSpot: место " + spotNumber + " сгенерировано",
+                    MessageType.STATUS);
         }
     }
 
@@ -262,9 +360,9 @@ public class ParkingSpot extends JPanel implements Runnable {
         logMessage("Место " + spotNumber + " успешно занято");
         logMessage("Автомобиль припаркован идеально");
 
-        if (SocketUtils.isPortAvailable("localhost", 5001)) {
-            SocketUtils.sendMessage("localhost", 5001, "PARKING_COMPLETED:" + spotNumber);
-        }
+        produceMessage("Autopilot", "PARKING_COMPLETED:" + spotNumber, MessageType.DATA);
+        produceMessage("StatusWindow", "ParkingSpot: парковка завершена на месте " + spotNumber,
+                MessageType.STATUS);
 
         SwingUtilities.invokeLater(() -> {
             confirmParkingButton.setEnabled(true);
@@ -295,22 +393,20 @@ public class ParkingSpot extends JPanel implements Runnable {
         updateGuidanceStatus("Наведение активно", Color.BLUE);
         logMessage("Система наведения готова к работе");
 
-        if (SocketUtils.isPortAvailable("localhost", 5001)) {
-            String guidanceMessage = "GUIDANCE_DATA:" +
-                    String.format(Locale.US, "%.1f", recommendedSpeed) + ":" +
-                    String.format(Locale.US, "%.1f", steeringCorrection) + ":" +
-                    approachDirection;
-            SocketUtils.sendMessage("localhost", 5001, guidanceMessage);
-        }
+        String guidanceMessage = "GUIDANCE_DATA:" +
+                String.format(Locale.US, "%.1f", recommendedSpeed) + ":" +
+                String.format(Locale.US, "%.1f", steeringCorrection) + ":" +
+                approachDirection;
+        produceMessage("Autopilot", guidanceMessage, MessageType.DATA);
     }
 
     public void confirmParking() {
         if (isOccupied) {
             logMessage("Подтверждение парковки на месте " + spotNumber);
 
-            if (SocketUtils.isPortAvailable("localhost", 5001)) {
-                SocketUtils.sendMessage("localhost", 5001, "PARKING_CONFIRMED:" + spotNumber);
-            }
+            produceMessage("Autopilot", "PARKING_CONFIRMED:" + spotNumber, MessageType.DATA);
+            produceMessage("StatusWindow", "ParkingSpot: парковка подтверждена",
+                    MessageType.STATUS);
 
             logMessage("✓ Парковка подтверждена оператором");
             updateGuidanceStatus("Парковка подтверждена", Color.GREEN);
@@ -333,6 +429,9 @@ public class ParkingSpot extends JPanel implements Runnable {
         logMessage("Сброс состояния парковки");
         logMessage("Новое расстояние: " + String.format(Locale.US, "%.1f", distance) + "м");
 
+        produceMessage("StatusWindow", "ParkingSpot: сброс состояния",
+                MessageType.STATUS);
+
         SwingUtilities.invokeLater(() -> {
             confirmParkingButton.setEnabled(false);
             generateSpotButton.setEnabled(true);
@@ -343,6 +442,9 @@ public class ParkingSpot extends JPanel implements Runnable {
         logMessage("ЭКСТРЕННАЯ ОСТАНОВКА - приостановка наведения");
         updateGuidanceStatus("ЭКСТРЕННАЯ ОСТАНОВКА", Color.RED);
         guidanceActive = false;
+
+        produceMessage("StatusWindow", "ParkingSpot: экстренная остановка",
+                MessageType.EMERGENCY);
 
         new Thread(() -> {
             try {
@@ -382,6 +484,76 @@ public class ParkingSpot extends JPanel implements Runnable {
         }).start();
     }
 
+    private void testProducer() {
+        logMessage("=== ТЕСТ PRODUCER ===");
+
+        String[] testTargets = {"Autopilot", "StatusWindow"};
+        String[] testMessages = {
+                "SPOT:TEST-01:25.5",
+                "GUIDANCE_DATA:5.0:2.5:Прямой",
+                "PARKING_COMPLETED:TEST-01",
+                "ParkingSpot: тестовое сообщение"
+        };
+
+        for (int i = 0; i < Math.min(testTargets.length, testMessages.length); i++) {
+            produceMessage(testTargets[i], testMessages[i], MessageType.DATA);
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        logMessage("=== ТЕСТ PRODUCER ЗАВЕРШЕН ===");
+    }
+
+    private void testConsumer() {
+        logMessage("=== ТЕСТ CONSUMER ===");
+
+        for (int i = 1; i <= 5; i++) {
+            // Отправляем тестовые сообщения сами себе через SocketUtils
+            SocketUtils.sendMessageViaMQ("ParkingSpot", "ParkingSpot-Test",
+                    "Тестовое сообщение " + i, MessageType.COMMAND);
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        logMessage("=== ТЕСТ CONSUMER ЗАВЕРШЕН ===");
+    }
+
+    private void updateQueueStats() {
+        SwingUtilities.invokeLater(() -> {
+            int queueSize = SocketUtils.getQueueSize("ParkingSpot");
+            queueStatsLabel.setText(String.format("Отправлено: %d | Получено: %d | В очереди: %d",
+                    messagesSent, messagesReceived, queueSize));
+        });
+    }
+
+    private void updateIncomingQueueDisplay(Message message) {
+        SwingUtilities.invokeLater(() -> {
+            String line = String.format("[%tH:%tM:%tS] От: %-15s -> %s",
+                    message.getTimestamp(), message.getTimestamp(), message.getTimestamp(),
+                    message.getFrom(), message.getContent());
+            incomingQueueDisplay.append(line + "\n");
+            incomingQueueDisplay.setCaretPosition(incomingQueueDisplay.getDocument().getLength());
+        });
+    }
+
+    private void updateOutgoingQueueDisplay(Message message, String target) {
+        SwingUtilities.invokeLater(() -> {
+            String line = String.format("[%tH:%tM:%tS] -> %-15s: %s",
+                    message.getTimestamp(), message.getTimestamp(), message.getTimestamp(),
+                    target, message.getContent());
+            outgoingQueueDisplay.append(line + "\n");
+            outgoingQueueDisplay.setCaretPosition(outgoingQueueDisplay.getDocument().getLength());
+        });
+    }
+
     private void monitorParkingSpot() {
         if (!isOccupied && distance > 0) {
             if (System.currentTimeMillis() % 15000 < 1000) {
@@ -410,7 +582,7 @@ public class ParkingSpot extends JPanel implements Runnable {
     }
 
     private double calculateSteeringCorrection() {
-        return (random.nextDouble() - 0.5) * 10.0; // ±5 градусов
+        return (random.nextDouble() - 0.5) * 10.0;
     }
 
     private String getApproachDirection() {
@@ -470,12 +642,6 @@ public class ParkingSpot extends JPanel implements Runnable {
         });
     }
 
-    private void updateIncomingCommand(String command) {
-        SwingUtilities.invokeLater(() -> {
-            incomingCommandField.setText(command);
-        });
-    }
-
     private void logMessage(String message) {
         SwingUtilities.invokeLater(() -> {
             String timestamp = timeFormat.format(new Date());
@@ -486,7 +652,7 @@ public class ParkingSpot extends JPanel implements Runnable {
 
     private void initializeGUI() {
         setLayout(new BorderLayout());
-        setBorder(BorderFactory.createTitledBorder("Система парковочного места"));
+        setBorder(BorderFactory.createTitledBorder("Система парковочного места (Hybrid)"));
 
         JPanel topPanel = new JPanel(new GridLayout(2, 1, 5, 5));
 
@@ -546,16 +712,16 @@ public class ParkingSpot extends JPanel implements Runnable {
         guidanceProgressBar.setForeground(Color.BLUE);
         guidanceProgressPanel.add(guidanceProgressBar, BorderLayout.CENTER);
 
-        JPanel commandPanel = new JPanel(new BorderLayout());
-        commandPanel.setBorder(BorderFactory.createTitledBorder("Входящие команды"));
-        incomingCommandField = new JTextField();
-        incomingCommandField.setEditable(false);
-        incomingCommandField.setFont(new Font("Arial", Font.PLAIN, 12));
-        commandPanel.add(incomingCommandField, BorderLayout.CENTER);
+        queueStatsLabel = new JLabel("Отправлено: 0 | Получено: 0 | В очереди: 0");
+        queueStatsLabel.setFont(new Font("Arial", Font.BOLD, 12));
+        queueStatsLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        queueStatsLabel.setBorder(BorderFactory.createTitledBorder("Статистика очередей"));
+        JPanel statsPanel = new JPanel(new BorderLayout());
+        statsPanel.add(queueStatsLabel, BorderLayout.CENTER);
 
         centerPanel.add(distanceProgressPanel);
         centerPanel.add(guidanceProgressPanel);
-        centerPanel.add(commandPanel);
+        centerPanel.add(statsPanel);
 
         JPanel buttonPanel = new JPanel(new FlowLayout());
         buttonPanel.setBorder(BorderFactory.createTitledBorder("Быстрое управление"));
@@ -573,30 +739,52 @@ public class ParkingSpot extends JPanel implements Runnable {
         buttonPanel.add(confirmParkingButton);
         buttonPanel.add(manualGuidanceButton);
 
+        JPanel queuePanel = new JPanel(new GridLayout(1, 2, 10, 10));
+
+        JPanel incomingPanel = new JPanel(new BorderLayout());
+        incomingPanel.setBorder(BorderFactory.createTitledBorder("Входящая очередь (Consumer)"));
+        incomingQueueDisplay = new JTextArea(10, 30);
+        incomingQueueDisplay.setEditable(false);
+        JScrollPane incomingScroll = new JScrollPane(incomingQueueDisplay);
+        incomingPanel.add(incomingScroll, BorderLayout.CENTER);
+
+        JButton clearIncomingButton = new JButton("Очистить");
+        clearIncomingButton.addActionListener(e -> {
+            incomingQueueDisplay.setText("");
+            logMessage("Входящая очередь очищена");
+        });
+        incomingPanel.add(clearIncomingButton, BorderLayout.SOUTH);
+
+        JPanel outgoingPanel = new JPanel(new BorderLayout());
+        outgoingPanel.setBorder(BorderFactory.createTitledBorder("Исходящая очередь (Producer)"));
+        outgoingQueueDisplay = new JTextArea(10, 30);
+        outgoingQueueDisplay.setEditable(false);
+        JScrollPane outgoingScroll = new JScrollPane(outgoingQueueDisplay);
+        outgoingPanel.add(outgoingScroll, BorderLayout.CENTER);
+
+        JButton clearOutgoingButton = new JButton("Очистить");
+        clearOutgoingButton.addActionListener(e -> {
+            outgoingQueueDisplay.setText("");
+            logMessage("Исходящая очередь очищена");
+        });
+        outgoingPanel.add(clearOutgoingButton, BorderLayout.SOUTH);
+
+        queuePanel.add(incomingPanel);
+        queuePanel.add(outgoingPanel);
+
         logArea = new JTextArea(12, 60);
         logArea.setEditable(false);
         JScrollPane scrollPane = new JScrollPane(logArea);
         scrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы системы"));
 
+        JSplitPane mainSplitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
+        mainSplitPane.setTopComponent(new JScrollPane(queuePanel));
+        mainSplitPane.setBottomComponent(scrollPane);
+        mainSplitPane.setResizeWeight(0.5);
+
         add(topPanel, BorderLayout.NORTH);
         add(centerPanel, BorderLayout.CENTER);
         add(buttonPanel, BorderLayout.SOUTH);
-        add(scrollPane, BorderLayout.EAST);
-    }
-
-    public String getSpotNumber() {
-        return spotNumber;
-    }
-
-    public double getDistance() {
-        return distance;
-    }
-
-    public boolean isOccupied() {
-        return isOccupied;
-    }
-
-    public boolean isGuidanceActive() {
-        return guidanceActive;
+        add(mainSplitPane, BorderLayout.EAST);
     }
 }

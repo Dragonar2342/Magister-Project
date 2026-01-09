@@ -1,31 +1,41 @@
-package ru.zolotuhin.ParrerelMethods.Lab6;
+package ru.zolotuhin.ParrerelMethods.Lab8;
 
 import javax.swing.*;
 import java.awt.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.LinkedBlockingQueue;
 
 public class Brake extends JPanel implements Runnable {
     private Thread thread;
+    private Thread consumerThread;
+    private Thread heartbeatThread;
     private final AtomicBoolean systemRunning;
 
     private JLabel speedLabel;
     private JLabel brakeLevelLabel;
-    private JLabel commandLabel;
     private JLabel statusLabel;
     private JTextField incomingCommandField;
     private JProgressBar speedBar;
     private JProgressBar brakeBar;
     private JTextArea logArea;
+    private JTextArea queueDisplay;
 
     private int currentBrakeLevel = 0;
-    private double currentSpeed = 0.0;
+    private double currentSpeed = 30.0;
     private boolean emergencyMode = false;
 
     public Brake(AtomicBoolean systemRunning) {
         this.systemRunning = systemRunning;
-        initializeGUI();
 
-        SocketUtils.startServer(5004, this::handleIncomingMessage);
+        // Регистрируем компонент
+        SocketUtils.registerComponent("Brake");
+
+        initializeGUI();
+        startConsumer();
+        startHeartbeat();
+
+        // Отправляем сообщение о запуске
+        sendStatusMessage("Brake: запущен");
     }
 
     public static void main(String[] args) {
@@ -44,9 +54,7 @@ public class Brake extends JPanel implements Runnable {
             JButton stopButton = new JButton("Остановка");
             JButton emergencyButton = new JButton("Экстренная остановка");
             JButton releaseButton = new JButton("Отпустить тормоза");
-            JButton brake20Button = new JButton("Тормоз 20%");
-            JButton brake50Button = new JButton("Тормоз 50%");
-            JButton brake80Button = new JButton("Тормоз 80%");
+            JButton testQueueButton = new JButton("Тест очереди");
 
             startButton.addActionListener(e -> {
                 brake.start();
@@ -68,38 +76,64 @@ public class Brake extends JPanel implements Runnable {
                 brake.logMessage("Ручное отпускание тормозов");
             });
 
-            brake20Button.addActionListener(e -> {
-                brake.applyBrake(20);
-                brake.logMessage("Ручное торможение 20%");
-            });
-
-            brake50Button.addActionListener(e -> {
-                brake.applyBrake(50);
-                brake.logMessage("Ручное торможение 50%");
-            });
-
-            brake80Button.addActionListener(e -> {
-                brake.applyBrake(80);
-                brake.logMessage("Ручное торможение 80%");
+            testQueueButton.addActionListener(e -> {
+                brake.testQueueProcessing();
+                brake.logMessage("Тест обработки очереди");
             });
 
             controlPanel.add(startButton);
             controlPanel.add(stopButton);
             controlPanel.add(emergencyButton);
             controlPanel.add(releaseButton);
-            controlPanel.add(brake20Button);
-            controlPanel.add(brake50Button);
-            controlPanel.add(brake80Button);
+            controlPanel.add(testQueueButton);
 
             frame.add(controlPanel, BorderLayout.NORTH);
             frame.add(brake, BorderLayout.CENTER);
 
-            frame.setSize(800, 600);
+            frame.setSize(900, 700);
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
 
             brake.start();
         });
+    }
+
+    private void startConsumer() {
+        consumerThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                // Потребляем сообщения из центральной очереди
+                Message message = SocketUtils.receiveMessageViaMQ("Brake");
+
+                if (message != null) {
+                    processMessage(message);
+                    updateQueueDisplay(message);
+                }
+            }
+        }, "Brake-Consumer");
+        consumerThread.start();
+    }
+
+    private void startHeartbeat() {
+        heartbeatThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                try {
+                    sendHeartbeat();
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "Brake-Heartbeat");
+        heartbeatThread.start();
+    }
+
+    private void sendHeartbeat() {
+        SocketUtils.sendMessageViaMQ("StatusWindow", "Brake", "HEARTBEAT", MessageType.HEARTBEAT);
+    }
+
+    private void sendStatusMessage(String content) {
+        SocketUtils.sendMessageViaMQ("StatusWindow", "Brake", content, MessageType.STATUS);
     }
 
     public void start() {
@@ -116,16 +150,15 @@ public class Brake extends JPanel implements Runnable {
         if (thread != null) {
             thread.interrupt();
         }
+        if (consumerThread != null) {
+            consumerThread.interrupt();
+        }
         updateStatus("Неактивна", Color.RED);
-    }
-
-    public boolean isAlive() {
-        return thread != null && thread.isAlive();
     }
 
     @Override
     public void run() {
-        logMessage("Тормозная система запущена");
+        logMessage("Тормозная система запущена (Consumer)");
         updateStatus("Активна", Color.GREEN);
 
         while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
@@ -137,9 +170,7 @@ public class Brake extends JPanel implements Runnable {
                 }
 
                 updateSpeed(currentSpeed);
-
                 monitorBrakeSystem();
-
                 Thread.sleep(500);
 
             } catch (InterruptedException e) {
@@ -152,21 +183,31 @@ public class Brake extends JPanel implements Runnable {
         updateStatus("Неактивна", Color.RED);
     }
 
-    private void handleIncomingMessage(String message) {
-        updateIncomingCommand(message);
-        logMessage("Получена команда: " + message);
+    private void processMessage(Message message) {
+        String content = message.getContent();
+        String from = message.getFrom();
 
-        if (message.startsWith("APPLY_BRAKE:")) {
+        logMessage("Обработка сообщения от " + from + ": " + content);
+        updateIncomingCommand(content);
+
+        if (content.startsWith("APPLY_BRAKE:")) {
             try {
-                int intensity = Integer.parseInt(message.substring(12));
+                int intensity = Integer.parseInt(content.substring(12));
                 applyBrake(intensity);
             } catch (NumberFormatException e) {
-                logMessage("Ошибка парсинга интенсивности торможения: " + message);
+                logMessage("Ошибка парсинга интенсивности торможения: " + content);
             }
-        } else if ("EMERGENCY_STOP".equals(message)) {
+        } else if ("EMERGENCY_STOP".equals(content) || "FULL_STOP".equals(content)) {
             emergencyStop();
-        } else if ("RELEASE_BRAKE".equals(message)) {
+        } else if ("RELEASE_BRAKE".equals(content) || "STOP".equals(content)) {
             applyBrake(0);
+        } else if (content.startsWith("BRAKE:")) {
+            try {
+                int intensity = Integer.parseInt(content.substring(6));
+                applyBrake(intensity);
+            } catch (NumberFormatException e) {
+                logMessage("Ошибка парсинга команды торможения: " + content);
+            }
         }
     }
 
@@ -182,7 +223,6 @@ public class Brake extends JPanel implements Runnable {
             currentBrakeLevel = newBrakeLevel;
             emergencyMode = (currentBrakeLevel == 100);
 
-            updateCommand("Торможение " + currentBrakeLevel + "%");
             logMessage("Применение торможения: " + currentBrakeLevel + "%");
             updateBrakeLevel(currentBrakeLevel);
 
@@ -200,8 +240,28 @@ public class Brake extends JPanel implements Runnable {
     public void emergencyStop() {
         logMessage("АКТИВАЦИЯ ЭКСТРЕННОГО ТОРМОЖЕНИЯ!");
         applyBrake(100);
+    }
 
-        SocketUtils.sendMessage("localhost", 5001, "EMERGENCY_BRAKE_ACTIVATED");
+    private void testQueueProcessing() {
+        // Тестовые сообщения для проверки работы Consumer
+        String[] testMessages = {
+                "APPLY_BRAKE:30",
+                "APPLY_BRAKE:70",
+                "EMERGENCY_STOP",
+                "RELEASE_BRAKE",
+                "BRAKE:50"
+        };
+
+        logMessage("=== ТЕСТ ОБРАБОТКИ ОЧЕРЕДИ ===");
+        for (String msg : testMessages) {
+            SocketUtils.sendMessageViaMQ("Test", "Brake", msg, MessageType.COMMAND);
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        logMessage("=== ТЕСТ ЗАВЕРШЕН ===");
     }
 
     private void monitorBrakeSystem() {
@@ -213,14 +273,20 @@ public class Brake extends JPanel implements Runnable {
             logMessage("✓ Проверка давления в тормозной системе - НОРМА");
         }
 
-        if (System.currentTimeMillis() % 20000 < 500) {
-            logMessage("✓ Мониторинг температуры тормозов - НОРМА");
-        }
-
         if (currentBrakeLevel > 80 && !emergencyMode) {
             logMessage("ПРЕДУПРЕЖДЕНИЕ: Высокий уровень торможения " + currentBrakeLevel + "%");
             updateStatus("Интенсивное торможение", Color.ORANGE);
         }
+    }
+
+    private void updateQueueDisplay(Message message) {
+        SwingUtilities.invokeLater(() -> {
+            String line = String.format("[%tH:%tM:%tS] От: %-15s -> %s",
+                    message.getTimestamp(), message.getTimestamp(), message.getTimestamp(),
+                    message.getFrom(), message.getContent());
+            queueDisplay.append(line + "\n");
+            queueDisplay.setCaretPosition(queueDisplay.getDocument().getLength());
+        });
     }
 
     private void updateSpeed(double speed) {
@@ -228,15 +294,14 @@ public class Brake extends JPanel implements Runnable {
             speedLabel.setText(String.format("%.1f км/ч", speed));
             speedBar.setValue((int)speed);
             speedBar.setString(String.format("%.1f км/ч", speed));
-
-            if (speed > 20) {
-                speedBar.setForeground(Color.RED);
-            } else if (speed > 10) {
-                speedBar.setForeground(Color.ORANGE);
-            } else {
-                speedBar.setForeground(Color.GREEN);
-            }
+            speedBar.setForeground(getSpeedColor(speed));
         });
+    }
+
+    private Color getSpeedColor(double speed) {
+        if (speed > 20) return Color.RED;
+        if (speed > 10) return Color.ORANGE;
+        return Color.GREEN;
     }
 
     private void updateBrakeLevel(int level) {
@@ -244,34 +309,23 @@ public class Brake extends JPanel implements Runnable {
             brakeLevelLabel.setText(level + "%");
             brakeBar.setValue(level);
             brakeBar.setString(level + "%");
-
-            if (level > 80) {
-                brakeBar.setForeground(Color.RED);
-            } else if (level > 50) {
-                brakeBar.setForeground(Color.ORANGE);
-            } else if (level > 20) {
-                brakeBar.setForeground(Color.YELLOW);
-            } else {
-                brakeBar.setForeground(Color.GREEN);
-            }
+            brakeBar.setForeground(getBrakeColor(level));
         });
     }
 
-    private void updateCommand(String command) {
-        SwingUtilities.invokeLater(() -> {
-            commandLabel.setText("Команда: " + command);
-        });
+    private Color getBrakeColor(int level) {
+        if (level > 80) return Color.RED;
+        if (level > 50) return Color.ORANGE;
+        if (level > 20) return Color.YELLOW;
+        return Color.GREEN;
     }
 
     private void updateStatus(String status, Color color) {
         SwingUtilities.invokeLater(() -> {
             statusLabel.setText(status);
             statusLabel.setBackground(color);
-            if (color == Color.RED || color == Color.ORANGE) {
-                statusLabel.setForeground(Color.WHITE);
-            } else {
-                statusLabel.setForeground(Color.BLACK);
-            }
+            statusLabel.setForeground(color == Color.RED || color == Color.ORANGE ?
+                    Color.WHITE : Color.BLACK);
         });
     }
 
@@ -288,9 +342,21 @@ public class Brake extends JPanel implements Runnable {
         });
     }
 
+    private void produceMessage(String target, String content, MessageType type) {
+        Message message = new Message(
+                "Brake", content, type);
+        boolean success = SocketUtils.sendMessageViaMQ(target, "Brake", content, type);
+
+        if (success) {
+            logMessage("Сообщение отправлено в " + target + ": " + content);
+        } else {
+            logMessage("ОШИБКА: очередь " + target + " переполнена!");
+        }
+    }
+
     private void initializeGUI() {
         setLayout(new BorderLayout());
-        setBorder(BorderFactory.createTitledBorder("Тормозная система"));
+        setBorder(BorderFactory.createTitledBorder("Тормозная система (Consumer)"));
 
         JPanel topPanel = new JPanel(new GridLayout(1, 2, 10, 5));
 
@@ -300,15 +366,14 @@ public class Brake extends JPanel implements Runnable {
         statusLabel.setOpaque(true);
         statusLabel.setBackground(Color.RED);
         statusLabel.setForeground(Color.WHITE);
-        statusLabel.setPreferredSize(new Dimension(200, 40));
         statusPanel.add(statusLabel, BorderLayout.CENTER);
         statusPanel.setBorder(BorderFactory.createTitledBorder("Статус системы"));
 
         JPanel commandPanel = new JPanel(new BorderLayout());
-        commandLabel = new JLabel("Команда: Нет", JLabel.CENTER);
-        commandLabel.setFont(new Font("Arial", Font.PLAIN, 14));
-        commandPanel.add(commandLabel, BorderLayout.CENTER);
-        commandPanel.setBorder(BorderFactory.createTitledBorder("Управление"));
+        commandPanel.setBorder(BorderFactory.createTitledBorder("Последняя команда"));
+        incomingCommandField = new JTextField("Ожидание команд...");
+        incomingCommandField.setEditable(false);
+        commandPanel.add(incomingCommandField, BorderLayout.CENTER);
 
         topPanel.add(statusPanel);
         topPanel.add(commandPanel);
@@ -318,12 +383,12 @@ public class Brake extends JPanel implements Runnable {
 
         JPanel speedPanel = new JPanel(new BorderLayout());
         speedPanel.setBorder(BorderFactory.createTitledBorder("Скорость автомобиля"));
-        speedLabel = new JLabel("0.0 км/ч", JLabel.CENTER);
+        speedLabel = new JLabel("30.0 км/ч", JLabel.CENTER);
         speedLabel.setFont(new Font("Arial", Font.BOLD, 16));
         speedBar = new JProgressBar(0, 50);
-        speedBar.setValue(0);
+        speedBar.setValue(30);
         speedBar.setStringPainted(true);
-        speedBar.setString("0.0 км/ч");
+        speedBar.setString("30.0 км/ч");
         speedBar.setForeground(Color.GREEN);
         speedPanel.add(speedLabel, BorderLayout.NORTH);
         speedPanel.add(speedBar, BorderLayout.CENTER);
@@ -340,36 +405,33 @@ public class Brake extends JPanel implements Runnable {
         brakePanel.add(brakeLevelLabel, BorderLayout.NORTH);
         brakePanel.add(brakeBar, BorderLayout.CENTER);
 
-        JPanel incomingPanel = new JPanel(new BorderLayout());
-        incomingPanel.setBorder(BorderFactory.createTitledBorder("Входящие команды"));
-        incomingCommandField = new JTextField();
-        incomingCommandField.setEditable(false);
-        incomingCommandField.setFont(new Font("Arial", Font.PLAIN, 12));
-        incomingPanel.add(incomingCommandField, BorderLayout.CENTER);
-
         centerPanel.add(speedPanel);
         centerPanel.add(brakePanel);
-        centerPanel.add(incomingPanel);
 
-        logArea = new JTextArea(10, 50);
+        JPanel queuePanel = new JPanel(new BorderLayout());
+        queuePanel.setBorder(BorderFactory.createTitledBorder("Очередь входящих сообщений (Consumer)"));
+        queueDisplay = new JTextArea(8, 40);
+        queueDisplay.setEditable(false);
+        JScrollPane queueScrollPane = new JScrollPane(queueDisplay);
+        queuePanel.add(queueScrollPane, BorderLayout.CENTER);
+
+        JButton clearQueueButton = new JButton("Очистить очередь");
+        clearQueueButton.addActionListener(e -> {
+            queueDisplay.setText("");
+            logMessage("Очередь очищена");
+        });
+        queuePanel.add(clearQueueButton, BorderLayout.SOUTH);
+
+        logArea = new JTextArea(8, 50);
         logArea.setEditable(false);
-        JScrollPane scrollPane = new JScrollPane(logArea);
-        scrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы"));
+        JScrollPane logScrollPane = new JScrollPane(logArea);
+        logScrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы"));
+
+        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, queuePanel, logScrollPane);
+        splitPane.setResizeWeight(0.5);
 
         add(topPanel, BorderLayout.NORTH);
         add(centerPanel, BorderLayout.CENTER);
-        add(scrollPane, BorderLayout.SOUTH);
-    }
-
-    public int getCurrentBrakeLevel() {
-        return currentBrakeLevel;
-    }
-
-    public double getCurrentSpeed() {
-        return currentSpeed;
-    }
-
-    public boolean isEmergencyMode() {
-        return emergencyMode;
+        add(splitPane, BorderLayout.SOUTH);
     }
 }

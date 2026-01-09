@@ -1,4 +1,4 @@
-package ru.zolotuhin.ParrerelMethods.Lab6;
+package ru.zolotuhin.ParrerelMethods.Lab5;
 
 import javax.swing.*;
 import java.awt.*;

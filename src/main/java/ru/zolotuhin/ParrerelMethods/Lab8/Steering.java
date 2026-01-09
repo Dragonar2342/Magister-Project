@@ -1,4 +1,4 @@
-package ru.zolotuhin.ParrerelMethods.Lab6;
+package ru.zolotuhin.ParrerelMethods.Lab8;
 
 import javax.swing.*;
 import java.awt.*;
@@ -6,14 +6,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Steering extends JPanel implements Runnable {
     private Thread thread;
+    private Thread consumerThread;
+    private Thread heartbeatThread;
     private final AtomicBoolean systemRunning;
 
     private JLabel currentAngleLabel;
-    private JLabel commandLabel;
     private JLabel statusLabel;
     private JTextField incomingCommandField;
     private JProgressBar angleBar;
     private JTextArea logArea;
+    private JTextArea queueDisplay;
 
     private int operationCount = 0;
     private int currentAngle = 0;
@@ -21,9 +23,16 @@ public class Steering extends JPanel implements Runnable {
 
     public Steering(AtomicBoolean systemRunning) {
         this.systemRunning = systemRunning;
-        initializeGUI();
 
-        SocketUtils.startServer(5005, this::handleIncomingMessage);
+        // Регистрируем компонент через SocketUtils
+        SocketUtils.registerComponent("Steering");
+
+        initializeGUI();
+        startConsumer();
+        startHeartbeat();
+
+        // Отправляем сообщение о запуске
+        sendStatusMessage("Steering: запущен");
     }
 
     public static void main(String[] args) {
@@ -42,8 +51,7 @@ public class Steering extends JPanel implements Runnable {
             JButton stopButton = new JButton("Остановка");
             JButton calibrateButton = new JButton("Калибровка");
             JButton neutralButton = new JButton("В нейтраль");
-            JButton leftButton = new JButton("Повернуть налево");
-            JButton rightButton = new JButton("Повернуть направо");
+            JButton testQueueButton = new JButton("Тест очереди");
 
             startButton.addActionListener(e -> {
                 steering.start();
@@ -65,32 +73,65 @@ public class Steering extends JPanel implements Runnable {
                 steering.logMessage("Ручной возврат в нейтральное положение");
             });
 
-            leftButton.addActionListener(e -> {
-                steering.turnWheels(-45);
-                steering.logMessage("Ручной поворот налево на 45°");
-            });
-
-            rightButton.addActionListener(e -> {
-                steering.turnWheels(45);
-                steering.logMessage("Ручной поворот направо на 45°");
+            testQueueButton.addActionListener(e -> {
+                steering.testQueueProcessing();
+                steering.logMessage("Тест обработки очереди");
             });
 
             controlPanel.add(startButton);
             controlPanel.add(stopButton);
             controlPanel.add(calibrateButton);
             controlPanel.add(neutralButton);
-            controlPanel.add(leftButton);
-            controlPanel.add(rightButton);
+            controlPanel.add(testQueueButton);
 
             frame.add(controlPanel, BorderLayout.NORTH);
             frame.add(steering, BorderLayout.CENTER);
 
-            frame.setSize(800, 600);
+            frame.setSize(900, 700);
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
 
             steering.start();
         });
+    }
+
+    private void startConsumer() {
+        consumerThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                // Потребляем сообщения из центральной очереди через SocketUtils
+                Message message = SocketUtils.receiveMessageViaMQ("Steering");
+
+                if (message != null) {
+                    processMessage(message);
+                    updateQueueDisplay(message);
+                }
+            }
+        }, "Steering-Consumer");
+        consumerThread.start();
+    }
+
+    private void startHeartbeat() {
+        heartbeatThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                try {
+                    sendHeartbeat();
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "Steering-Heartbeat");
+        heartbeatThread.start();
+    }
+
+    private void sendHeartbeat() {
+        // Используем SocketUtils вместо MessageQueueManager
+        SocketUtils.sendMessageViaMQ("StatusWindow", "Steering", "HEARTBEAT", MessageType.HEARTBEAT);
+    }
+
+    private void sendStatusMessage(String content) {
+        produceMessage("StatusWindow", content, MessageType.STATUS);
     }
 
     public void start() {
@@ -107,19 +148,16 @@ public class Steering extends JPanel implements Runnable {
         if (thread != null) {
             thread.interrupt();
         }
+        if (consumerThread != null) {
+            consumerThread.interrupt();
+        }
         updateStatus("Неактивна", Color.RED);
-    }
-
-    public boolean isAlive() {
-        return thread != null && thread.isAlive();
     }
 
     @Override
     public void run() {
-        logMessage("Система рулевого управления запущена");
+        logMessage("Система рулевого управления запущена (Consumer)");
         updateStatus("Активна", Color.GREEN);
-
-        performCalibration();
 
         while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
             try {
@@ -149,23 +187,33 @@ public class Steering extends JPanel implements Runnable {
         updateStatus("Неактивна", Color.RED);
     }
 
-    private void handleIncomingMessage(String message) {
-        updateIncomingCommand(message);
-        logMessage("Получена команда: " + message);
+    private void processMessage(Message message) {
+        String content = message.getContent();
+        String from = message.getFrom();
 
-        if (message.startsWith("TURN_WHEELS:")) {
+        logMessage("Обработка сообщения от " + from + ": " + content);
+        updateIncomingCommand(content);
+
+        if (content.startsWith("TURN_WHEELS:")) {
             try {
-                int angle = Integer.parseInt(message.substring(12));
+                int angle = Integer.parseInt(content.substring(12));
                 turnWheels(angle);
             } catch (NumberFormatException e) {
-                logMessage("Ошибка парсинга угла поворота: " + message);
+                logMessage("Ошибка парсинга угла поворота: " + content);
             }
-        } else if ("RETURN_NEUTRAL".equals(message)) {
+        } else if ("RETURN_NEUTRAL".equals(content) || "NEUTRAL".equals(content)) {
             returnToNeutral();
-        } else if ("CALIBRATE".equals(message)) {
+        } else if ("CALIBRATE".equals(content) || "CALIBRATION".equals(content)) {
             performCalibration();
-        } else if ("EMERGENCY_STOP".equals(message)) {
+        } else if ("EMERGENCY_STOP".equals(content)) {
             handleEmergencyStop();
+        } else if (content.startsWith("ANGLE:")) {
+            try {
+                int angle = Integer.parseInt(content.substring(6));
+                turnWheels(angle);
+            } catch (NumberFormatException e) {
+                logMessage("Ошибка парсинга команды угла: " + content);
+            }
         }
     }
 
@@ -180,10 +228,8 @@ public class Steering extends JPanel implements Runnable {
 
         if (newAngle != currentAngle) {
             currentAngle = newAngle;
-            updateCommand("Поворот на " + angle + "°");
             logMessage("Поворот колес на угол " + currentAngle + "°");
             updateAngle(currentAngle);
-
             simulateSteeringMovement();
         }
     }
@@ -192,7 +238,6 @@ public class Steering extends JPanel implements Runnable {
         if (currentAngle != 0) {
             logMessage("Возврат колес в нейтральное положение");
             currentAngle = 0;
-            updateCommand("Возврат в нейтральное положение");
             updateAngle(currentAngle);
             simulateSteeringMovement();
         }
@@ -200,36 +245,52 @@ public class Steering extends JPanel implements Runnable {
 
     private void handleEmergencyStop() {
         logMessage("ЭКСТРЕННАЯ ОСТАНОВКА - фиксация текущего угла");
-        updateCommand("ЭКСТРЕННАЯ ОСТАНОВКА");
         updateStatus("ЭКСТРЕННАЯ ОСТАНОВКА", Color.RED);
     }
 
     private void performCalibration() {
         logMessage("Начало калибровки системы рулевого управления...");
         updateStatus("Калибровка", Color.ORANGE);
-        updateCommand("Калибровка системы");
 
         simulateCalibrationProcess();
 
         isCalibrated = true;
         logMessage("Калибровка системы рулевого управления завершена успешно");
         updateStatus("Активна", Color.GREEN);
-        updateCommand("Калибровка завершена");
 
-        SocketUtils.sendMessage("localhost", 5001, "STEERING_CALIBRATED");
+        // Отправляем сообщение о завершении калибровки
+        produceMessage("Autopilot", "STEERING_CALIBRATED", MessageType.STATUS);
+    }
+
+    private void testQueueProcessing() {
+        // Тестовые сообщения для проверки работы Consumer
+        String[] testMessages = {
+                "TURN_WHEELS:45",
+                "TURN_WHEELS:-30",
+                "RETURN_NEUTRAL",
+                "CALIBRATE",
+                "EMERGENCY_STOP"
+        };
+
+        logMessage("=== ТЕСТ ОБРАБОТКИ ОЧЕРЕДИ ===");
+        for (String msg : testMessages) {
+            // Отправляем через SocketUtils вместо MessageQueueManager
+            SocketUtils.sendMessageViaMQ("Steering", "Test", msg, MessageType.COMMAND);
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        logMessage("=== ТЕСТ ЗАВЕРШЕН ===");
     }
 
     private void monitorSteeringSystem() {
-        logMessage("Мониторинг системы управления...");
-
         if (operationCount % 5 == 0) {
             logMessage("✓ Проверка датчиков угла - ОК");
         }
         if (operationCount % 7 == 0) {
             logMessage("✓ Диагностика гидроусилителя - ОК");
-        }
-        if (operationCount % 10 == 0) {
-            logMessage("✓ Проверка связи с контроллерами - ОК");
         }
 
         if (Math.abs(currentAngle) > 75) {
@@ -258,37 +319,37 @@ public class Steering extends JPanel implements Runnable {
         }
     }
 
+    private void updateQueueDisplay(Message message) {
+        SwingUtilities.invokeLater(() -> {
+            String line = String.format("[%tH:%tM:%tS] От: %-15s -> %s",
+                    message.getTimestamp(), message.getTimestamp(), message.getTimestamp(),
+                    message.getFrom(), message.getContent());
+            queueDisplay.append(line + "\n");
+            queueDisplay.setCaretPosition(queueDisplay.getDocument().getLength());
+        });
+    }
+
     private void updateAngle(int angle) {
         SwingUtilities.invokeLater(() -> {
             currentAngleLabel.setText("Текущий угол: " + angle + "°");
             angleBar.setValue(angle);
             angleBar.setString(angle + "°");
-
-            if (Math.abs(angle) > 60) {
-                angleBar.setForeground(Color.RED);
-            } else if (Math.abs(angle) > 30) {
-                angleBar.setForeground(Color.ORANGE);
-            } else {
-                angleBar.setForeground(Color.GREEN);
-            }
+            angleBar.setForeground(getAngleColor(angle));
         });
     }
 
-    private void updateCommand(String command) {
-        SwingUtilities.invokeLater(() -> {
-            commandLabel.setText("Последняя команда: " + command);
-        });
+    private Color getAngleColor(int angle) {
+        if (Math.abs(angle) > 60) return Color.RED;
+        if (Math.abs(angle) > 30) return Color.ORANGE;
+        return Color.GREEN;
     }
 
     private void updateStatus(String status, Color color) {
         SwingUtilities.invokeLater(() -> {
             statusLabel.setText(status);
             statusLabel.setBackground(color);
-            if (color == Color.RED || color == Color.ORANGE) {
-                statusLabel.setForeground(Color.WHITE);
-            } else {
-                statusLabel.setForeground(Color.BLACK);
-            }
+            statusLabel.setForeground(color == Color.RED || color == Color.ORANGE ?
+                    Color.WHITE : Color.BLACK);
         });
     }
 
@@ -305,9 +366,20 @@ public class Steering extends JPanel implements Runnable {
         });
     }
 
+    private void produceMessage(String target, String content, MessageType type) {
+        // Используем SocketUtils вместо MessageQueueManager
+        boolean success = SocketUtils.sendMessageViaMQ(target, "Steering", content, type);
+
+        if (success) {
+            logMessage("Сообщение отправлено в " + target + ": " + content);
+        } else {
+            logMessage("ОШИБКА: очередь " + target + " переполнена или нет связи с сервером!");
+        }
+    }
+
     private void initializeGUI() {
         setLayout(new BorderLayout());
-        setBorder(BorderFactory.createTitledBorder("Рулевое управление"));
+        setBorder(BorderFactory.createTitledBorder("Рулевое управление (Consumer)"));
 
         JPanel topPanel = new JPanel(new GridLayout(1, 2, 10, 5));
 
@@ -317,15 +389,14 @@ public class Steering extends JPanel implements Runnable {
         statusLabel.setOpaque(true);
         statusLabel.setBackground(Color.RED);
         statusLabel.setForeground(Color.WHITE);
-        statusLabel.setPreferredSize(new Dimension(200, 40));
         statusPanel.add(statusLabel, BorderLayout.CENTER);
         statusPanel.setBorder(BorderFactory.createTitledBorder("Статус системы"));
 
         JPanel commandPanel = new JPanel(new BorderLayout());
-        commandLabel = new JLabel("Последняя команда: Нет", JLabel.CENTER);
-        commandLabel.setFont(new Font("Arial", Font.PLAIN, 14));
-        commandPanel.add(commandLabel, BorderLayout.CENTER);
-        commandPanel.setBorder(BorderFactory.createTitledBorder("Управление"));
+        commandPanel.setBorder(BorderFactory.createTitledBorder("Последняя команда"));
+        incomingCommandField = new JTextField("Ожидание команд...");
+        incomingCommandField.setEditable(false);
+        commandPanel.add(incomingCommandField, BorderLayout.CENTER);
 
         topPanel.add(statusPanel);
         topPanel.add(commandPanel);
@@ -342,35 +413,36 @@ public class Steering extends JPanel implements Runnable {
         angleBar.setStringPainted(true);
         angleBar.setString("0°");
         angleBar.setForeground(Color.GREEN);
-        angleBar.setPreferredSize(new Dimension(300, 40));
 
         centerPanel.add(currentAngleLabel, BorderLayout.NORTH);
         centerPanel.add(angleBar, BorderLayout.CENTER);
 
-        JPanel incomingPanel = new JPanel(new BorderLayout());
-        incomingPanel.setBorder(BorderFactory.createTitledBorder("Входящие команды"));
-        incomingCommandField = new JTextField();
-        incomingCommandField.setEditable(false);
-        incomingCommandField.setFont(new Font("Arial", Font.PLAIN, 12));
-        incomingPanel.add(incomingCommandField, BorderLayout.CENTER);
+        JPanel queuePanel = new JPanel(new BorderLayout());
+        queuePanel.setBorder(BorderFactory.createTitledBorder("Очередь входящих сообщений (Consumer)"));
+        queueDisplay = new JTextArea(10, 40);
+        queueDisplay.setEditable(false);
+        JScrollPane queueScrollPane = new JScrollPane(queueDisplay);
+        queuePanel.add(queueScrollPane, BorderLayout.CENTER);
 
-        centerPanel.add(incomingPanel, BorderLayout.SOUTH);
+        JButton clearQueueButton = new JButton("Очистить очередь");
+        clearQueueButton.addActionListener(e -> {
+            // Используем SocketUtils вместо MessageQueueManager
+            SocketUtils.clearQueue("Steering");
+            queueDisplay.setText("");
+            logMessage("Очередь очищена");
+        });
+        queuePanel.add(clearQueueButton, BorderLayout.SOUTH);
 
-        logArea = new JTextArea(12, 50);
+        logArea = new JTextArea(8, 50);
         logArea.setEditable(false);
-        JScrollPane scrollPane = new JScrollPane(logArea);
-        scrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы"));
+        JScrollPane logScrollPane = new JScrollPane(logArea);
+        logScrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы"));
+
+        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, queuePanel, logScrollPane);
+        splitPane.setResizeWeight(0.5);
 
         add(topPanel, BorderLayout.NORTH);
         add(centerPanel, BorderLayout.CENTER);
-        add(scrollPane, BorderLayout.SOUTH);
-    }
-
-    public int getCurrentAngle() {
-        return currentAngle;
-    }
-
-    public boolean isCalibrated() {
-        return isCalibrated;
+        add(splitPane, BorderLayout.SOUTH);
     }
 }

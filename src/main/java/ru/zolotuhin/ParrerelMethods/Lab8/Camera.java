@@ -1,40 +1,44 @@
-package ru.zolotuhin.ParrerelMethods.Lab6;
+package ru.zolotuhin.ParrerelMethods.Lab8;
 
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Random;
+import java.text.SimpleDateFormat;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Camera extends JPanel implements Runnable {
     private Thread thread;
+    private Thread heartbeatThread;
     private final AtomicBoolean systemRunning;
     private Map<String, JButton> obstacleButtons;
     private String currentObstacle = null;
+    private Random random = new Random();
 
     private JTextArea logArea;
     private JLabel obstacleLabel;
     private JLabel statusLabel;
-    private JTextField incomingCommandField;
     private JTextField outgoingCommandField;
     private JProgressBar analysisProgressBar;
+    private JTextArea queueDisplay;
 
     private int analysisCount = 0;
-    private Random random = new Random();
-
     private boolean parkingSpotFound = false;
+    private MessageType lastMessageType;
 
     public Camera(AtomicBoolean systemRunning) {
         this.systemRunning = systemRunning;
         this.obstacleButtons = new HashMap<>();
+        this.lastMessageType = MessageType.DATA;
+
+        SocketUtils.registerComponent("Camera");
 
         initializeGUI();
+        startHeartbeat();
 
-        SocketUtils.startServer(5002, this::handleIncomingMessage);
+        // Отправляем сообщение о запуске
+        sendStatusMessage("Camera: запущена");
     }
 
     public static void main(String[] args) {
@@ -53,6 +57,7 @@ public class Camera extends JPanel implements Runnable {
             JButton stopButton = new JButton("Остановка камеры");
             JButton findSpotButton = new JButton("Найти место");
             JButton calibrateButton = new JButton("Калибровка");
+            JButton sendTestMsgButton = new JButton("Тест сообщения");
 
             startButton.addActionListener(e -> {
                 camera.start();
@@ -74,20 +79,49 @@ public class Camera extends JPanel implements Runnable {
                 camera.logMessage("Ручная калибровка камеры");
             });
 
+            sendTestMsgButton.addActionListener(e -> {
+                camera.sendTestMessage();
+                camera.logMessage("Отправка тестового сообщения");
+            });
+
             controlPanel.add(startButton);
             controlPanel.add(stopButton);
             controlPanel.add(findSpotButton);
             controlPanel.add(calibrateButton);
+            controlPanel.add(sendTestMsgButton);
 
             frame.add(controlPanel, BorderLayout.NORTH);
             frame.add(camera, BorderLayout.CENTER);
 
-            frame.setSize(900, 700);
+            frame.setSize(1000, 750);
             frame.setLocationRelativeTo(null);
             frame.setVisible(true);
 
             camera.start();
         });
+    }
+
+    private void startHeartbeat() {
+        heartbeatThread = new Thread(() -> {
+            while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
+                try {
+                    sendHeartbeat();
+                    Thread.sleep(5000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "Camera-Heartbeat");
+        heartbeatThread.start();
+    }
+
+    private void sendHeartbeat() {
+        SocketUtils.sendMessageViaMQ("StatusWindow", "Camera", "HEARTBEAT", MessageType.HEARTBEAT);
+    }
+
+    private void sendStatusMessage(String content) {
+        produceMessage("StatusWindow", content, MessageType.STATUS);
     }
 
     public void start() {
@@ -107,19 +141,12 @@ public class Camera extends JPanel implements Runnable {
         updateStatus("Неактивна", Color.RED);
     }
 
-    public boolean isAlive() {
-        return thread != null && thread.isAlive();
-    }
-
     @Override
     public void run() {
         logMessage("Камера запущена и готова к работе");
         updateStatus("Активна", Color.GREEN);
 
-        if (!parkingSpotFound) {
-            findParkingSpot();
-            parkingSpotFound = true;
-        }
+        produceMessage("StatusWindow", "Camera: запущена", MessageType.STATUS);
 
         while (systemRunning.get() && !Thread.currentThread().isInterrupted()) {
             try {
@@ -133,7 +160,7 @@ public class Camera extends JPanel implements Runnable {
                 }
 
                 logMessage("=== Цикл анализа " + analysisCount + " завершен ===");
-                Thread.sleep(3000); // Анализ каждые 3 секунды
+                Thread.sleep(3000);
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -145,57 +172,7 @@ public class Camera extends JPanel implements Runnable {
         updateStatus("Неактивна", Color.RED);
     }
 
-    private void handleIncomingMessage(String message) {
-        updateIncomingCommand(message);
-        logMessage("Получена команда: " + message);
-
-        switch (message) {
-            case "ANALYZE_ENVIRONMENT" -> {
-                logMessage("Запрос анализа окружающей среды от автопилота");
-                analyzeEnvironment();
-            }
-            case "FIND_PARKING_SPOT" -> {
-                logMessage("Запрос поиска парковочного места");
-                findParkingSpot();
-            }
-            case "EMERGENCY_STOP" -> {
-                logMessage("Команда экстренной остановки - приостанавливаю анализ");
-                updateStatus("ЭКСТРЕННАЯ ОСТАНОВКА", Color.RED);
-                try {
-                    Thread.sleep(2000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                updateStatus("Активна", Color.GREEN);
-            }
-            case "CALIBRATION_NEEDED" -> {
-                logMessage("Запрос калибровки камеры");
-                performCalibration();
-            }
-            case "RESET_PARKING_SEARCH" -> {
-                logMessage("Сброс поиска парковочного места");
-                parkingSpotFound = false;
-            }
-        }
-    }
-
-    public void analyzeEnvironment() {
-        logMessage("Выполняю анализ окружающей среды...");
-        updateAnalysisProgress(30);
-
-        logMessage("✓ Сканирование пространства вокруг автомобиля");
-        updateAnalysisProgress(60);
-        logMessage("✓ Обнаружение статических объектов");
-        updateAnalysisProgress(80);
-        logMessage("✓ Отслеживание динамических объектов");
-        updateAnalysisProgress(100);
-
-        logMessage("Анализ окружающей среды завершен");
-
-        SocketUtils.sendMessage("localhost", 5001, "ENVIRONMENT_ANALYZED");
-    }
-
-    private void findParkingSpot() {
+    public void findParkingSpot() {
         if (parkingSpotFound) {
             logMessage("Парковочное место уже найдено, ожидание завершения парковки...");
             return;
@@ -210,7 +187,7 @@ public class Camera extends JPanel implements Runnable {
         String[] letters = {"A", "B", "C", "D"};
         String spotNumber = letters[random.nextInt(letters.length)] + "-" +
                 String.format("%02d", random.nextInt(50) + 1);
-        double distance = 25 + random.nextDouble() * 65; // 25-90 метров
+        double distance = 25 + random.nextDouble() * 65;
 
         logMessage("✓ Анализ доступных мест");
         updateAnalysisProgress(80);
@@ -221,32 +198,15 @@ public class Camera extends JPanel implements Runnable {
                 String.format("%.1f", distance) + "м");
 
         String spotMessage = "SPOT:" + spotNumber + ":" + String.format(Locale.US, "%.1f", distance);
-        sendCommandToAutopilot(spotMessage);
-        sendCommandToAutopilot("PARKING_SPOT_FOUND");
+
+        // Производим сообщения (только Producer)
+        produceMessage("Autopilot", spotMessage, MessageType.DATA);
+        produceMessage("ParkingSpot", "NEW_SPOT_DETECTED", MessageType.DATA);
+        produceMessage("StatusWindow", "Camera: парковочное место найдено: " + spotNumber,
+                MessageType.STATUS);
 
         parkingSpotFound = true;
-
         updateOutgoingCommand("PARKING_SPOT_FOUND: " + spotNumber);
-    }
-
-    private void sendCommandToAutopilot(String command) {
-        if (SocketUtils.isPortAvailable("localhost", 5001)) {
-            SocketUtils.sendMessage("localhost", 5001, command);
-        } else {
-            logMessage("Автопилот не доступен для команды: " + command);
-        }
-    }
-
-    private void performAnalysis() {
-        logMessage("Выполняю стандартный анализ...");
-        updateAnalysisProgress(25);
-        logMessage("✓ Сканирование пространства на наличие парковочных мест");
-        updateAnalysisProgress(50);
-        logMessage("✓ Обнаружение препятствий в реальном времени");
-        updateAnalysisProgress(75);
-        logMessage("✓ Обработка видеопотока и анализ изображения");
-        updateAnalysisProgress(100);
-        logMessage("Стандартный анализ завершен");
     }
 
     public void performCalibration() {
@@ -266,7 +226,31 @@ public class Camera extends JPanel implements Runnable {
         logMessage("Калибровка камеры завершена успешно");
         updateStatus("Активна", Color.GREEN);
 
-        SocketUtils.sendMessage("localhost", 5001, "CALIBRATION_COMPLETE");
+        produceMessage("Autopilot", "CALIBRATION_COMPLETE", MessageType.STATUS);
+        produceMessage("StatusWindow", "Camera: калибровка завершена",
+                MessageType.STATUS);
+    }
+
+    private void performAnalysis() {
+        logMessage("Выполняю стандартный анализ...");
+        updateAnalysisProgress(25);
+        logMessage("✓ Сканирование пространства на наличие парковочных мест");
+        updateAnalysisProgress(50);
+        logMessage("✓ Обнаружение препятствий в реальном времени");
+        updateAnalysisProgress(75);
+
+        // Случайное обнаружение препятствий (для демонстрации)
+        if (random.nextInt(10) > 7) {
+            String[] directions = {"СЛЕВА", "СПРАВА", "СПЕРЕДИ", "СЗАДИ"};
+            String obstacle = directions[random.nextInt(directions.length)];
+            produceMessage("Autopilot", "OBSTACLE_" + obstacle, MessageType.EMERGENCY);
+            produceMessage("StatusWindow", "Camera: обнаружено препятствие " + obstacle,
+                    MessageType.EMERGENCY);
+            logMessage("Обнаружено препятствие: " + obstacle);
+        }
+
+        updateAnalysisProgress(100);
+        logMessage("Стандартный анализ завершен");
     }
 
     private void handleObstacle(String direction) {
@@ -286,8 +270,9 @@ public class Camera extends JPanel implements Runnable {
         highlightButton(direction);
         logMessage("Обнаружено препятствие: " + direction);
 
-        SocketUtils.sendMessage("localhost", 5001, "OBSTACLE_" + direction);
-        updateOutgoingCommand("OBSTACLE_" + direction);
+        produceMessage("Autopilot", "OBSTACLE_" + direction, MessageType.EMERGENCY);
+        produceMessage("StatusWindow", "Camera: препятствие " + direction,
+                MessageType.EMERGENCY);
     }
 
     private void clearObstacle() {
@@ -298,8 +283,42 @@ public class Camera extends JPanel implements Runnable {
         currentObstacle = null;
         updateObstacleLabel(null);
 
-        SocketUtils.sendMessage("localhost", 5001, "OBSTACLE_CLEAR");
-        updateOutgoingCommand("OBSTACLE_CLEAR");
+        produceMessage("Autopilot", "OBSTACLE_CLEAR", MessageType.DATA);
+        produceMessage("StatusWindow", "Camera: препятствий нет", MessageType.STATUS);
+    }
+
+    private void produceMessage(String target, String content, MessageType type) {
+        boolean success = SocketUtils.sendMessageViaMQ(target, "Camera", content, type);
+
+        if (type != MessageType.HEARTBEAT) {
+            logMessage("Сообщение отправлено в " + target + ": " + content);
+        }
+    }
+
+    private void sendTestMessage() {
+        String[] testMessages = {
+                "Тестовое сообщение 1",
+                "ANALYZE_ENVIRONMENT",
+                "OBSTACLE_FRONT",
+                "CALIBRATION_NEEDED"
+        };
+
+        String target = "Autopilot";
+        String message = testMessages[random.nextInt(testMessages.length)];
+        MessageType type = MessageType.COMMAND;
+
+        produceMessage(target, message, type);
+    }
+
+    private void updateQueueDisplay(Message message, String target) {
+        SwingUtilities.invokeLater(() -> {
+            SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss");
+            String timestamp = sdf.format(new Date(message.getTimestamp()));
+            String line = String.format("[%s] -> %-15s: %s",
+                    timestamp, target, message.getContent());
+            queueDisplay.append(line + "\n");
+            queueDisplay.setCaretPosition(queueDisplay.getDocument().getLength());
+        });
     }
 
     private void updateObstacleLabel(String obstacle) {
@@ -320,17 +339,7 @@ public class Camera extends JPanel implements Runnable {
         SwingUtilities.invokeLater(() -> {
             statusLabel.setText(status);
             statusLabel.setBackground(color);
-            if (color == Color.RED) {
-                statusLabel.setForeground(Color.WHITE);
-            } else {
-                statusLabel.setForeground(Color.BLACK);
-            }
-        });
-    }
-
-    private void updateIncomingCommand(String command) {
-        SwingUtilities.invokeLater(() -> {
-            incomingCommandField.setText(command);
+            statusLabel.setForeground(color == Color.RED ? Color.WHITE : Color.BLACK);
         });
     }
 
@@ -343,14 +352,8 @@ public class Camera extends JPanel implements Runnable {
     private void updateAnalysisProgress(int progress) {
         SwingUtilities.invokeLater(() -> {
             analysisProgressBar.setValue(progress);
-
-            if (progress < 30) {
-                analysisProgressBar.setForeground(Color.RED);
-            } else if (progress < 70) {
-                analysisProgressBar.setForeground(Color.ORANGE);
-            } else {
-                analysisProgressBar.setForeground(Color.GREEN);
-            }
+            analysisProgressBar.setString(progress + "%");
+            analysisProgressBar.setForeground(getProgressColor(progress));
         });
 
         try {
@@ -358,6 +361,12 @@ public class Camera extends JPanel implements Runnable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private Color getProgressColor(int progress) {
+        if (progress < 30) return Color.RED;
+        if (progress < 70) return Color.ORANGE;
+        return Color.GREEN;
     }
 
     private void highlightButton(String direction) {
@@ -400,7 +409,7 @@ public class Camera extends JPanel implements Runnable {
 
     private void initializeGUI() {
         setLayout(new BorderLayout());
-        setBorder(BorderFactory.createTitledBorder("Система компьютерного зрения"));
+        setBorder(BorderFactory.createTitledBorder("Камера (Producer)"));
 
         JPanel topPanel = new JPanel(new GridLayout(1, 2, 10, 5));
 
@@ -409,9 +418,8 @@ public class Camera extends JPanel implements Runnable {
         obstacleLabel.setFont(new Font("Arial", Font.BOLD, 16));
         obstacleLabel.setOpaque(true);
         obstacleLabel.setBackground(Color.GREEN);
-        obstacleLabel.setPreferredSize(new Dimension(200, 40));
         obstaclePanel.add(obstacleLabel, BorderLayout.CENTER);
-        obstaclePanel.setBorder(BorderFactory.createTitledBorder("Статус препятствий"));
+        obstaclePanel.setBorder(BorderFactory.createTitledBorder("Обнаружение препятствий"));
 
         JPanel cameraStatusPanel = new JPanel(new BorderLayout());
         statusLabel = new JLabel("Неактивна", JLabel.CENTER);
@@ -419,7 +427,6 @@ public class Camera extends JPanel implements Runnable {
         statusLabel.setOpaque(true);
         statusLabel.setBackground(Color.RED);
         statusLabel.setForeground(Color.WHITE);
-        statusLabel.setPreferredSize(new Dimension(200, 40));
         cameraStatusPanel.add(statusLabel, BorderLayout.CENTER);
         cameraStatusPanel.setBorder(BorderFactory.createTitledBorder("Статус камеры"));
 
@@ -429,7 +436,7 @@ public class Camera extends JPanel implements Runnable {
         JPanel centerPanel = new JPanel(new BorderLayout());
 
         JPanel buttonPanel = createButtonPanel();
-        buttonPanel.setBorder(BorderFactory.createTitledBorder("Обнаружение препятствий"));
+        buttonPanel.setBorder(BorderFactory.createTitledBorder("Ручное обнаружение препятствий"));
         centerPanel.add(buttonPanel, BorderLayout.NORTH);
 
         JPanel progressPanel = new JPanel(new BorderLayout());
@@ -444,29 +451,32 @@ public class Camera extends JPanel implements Runnable {
 
         centerPanel.add(progressPanel, BorderLayout.CENTER);
 
-        JPanel commandPanel = new JPanel(new GridLayout(2, 2, 5, 5));
-        commandPanel.setBorder(BorderFactory.createTitledBorder("Коммуникация"));
-
-        commandPanel.add(new JLabel("Входящие команды:"));
-        incomingCommandField = new JTextField();
-        incomingCommandField.setEditable(false);
-        commandPanel.add(incomingCommandField);
-
-        commandPanel.add(new JLabel("Исходящие команды:"));
+        JPanel commandPanel = new JPanel(new BorderLayout());
+        commandPanel.setBorder(BorderFactory.createTitledBorder("Последнее отправленное сообщение"));
         outgoingCommandField = new JTextField();
         outgoingCommandField.setEditable(false);
-        commandPanel.add(outgoingCommandField);
+        commandPanel.add(outgoingCommandField, BorderLayout.CENTER);
 
         centerPanel.add(commandPanel, BorderLayout.SOUTH);
 
-        logArea = new JTextArea(15, 60);
+        JPanel queuePanel = new JPanel(new BorderLayout());
+        queuePanel.setBorder(BorderFactory.createTitledBorder("Очередь исходящих сообщений (Producer)"));
+        queueDisplay = new JTextArea(10, 40);
+        queueDisplay.setEditable(false);
+        JScrollPane queueScrollPane = new JScrollPane(queueDisplay);
+        queuePanel.add(queueScrollPane, BorderLayout.CENTER);
+
+        logArea = new JTextArea(10, 50);
         logArea.setEditable(false);
-        JScrollPane scrollPane = new JScrollPane(logArea);
-        scrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы камеры"));
+        JScrollPane logScrollPane = new JScrollPane(logArea);
+        logScrollPane.setBorder(BorderFactory.createTitledBorder("Журнал работы камеры"));
+
+        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, queuePanel, logScrollPane);
+        splitPane.setResizeWeight(0.5);
 
         add(topPanel, BorderLayout.NORTH);
         add(centerPanel, BorderLayout.CENTER);
-        add(scrollPane, BorderLayout.SOUTH);
+        add(splitPane, BorderLayout.SOUTH);
     }
 
     private JPanel createButtonPanel() {
@@ -495,7 +505,6 @@ public class Camera extends JPanel implements Runnable {
         JButton button = new JButton(direction);
         button.setBackground(Color.LIGHT_GRAY);
         button.setFont(new Font("Arial", Font.PLAIN, 14));
-        button.setPreferredSize(new Dimension(100, 50));
         button.addActionListener(new ObstacleButtonListener(direction.toUpperCase()));
         return button;
     }

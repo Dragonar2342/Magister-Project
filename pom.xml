@@ -7,10 +7,6 @@
     <packaging>pom</packaging>
     <name>Archetype - Magister</name>
   <url>http://maven.apache.org</url>
-    <modules>
-        <module>ServerPager</module>
-        <module>ClientPager</module>
-    </modules>
     <repositories>
         <repository>
             <id>jzy3d-releases</id>

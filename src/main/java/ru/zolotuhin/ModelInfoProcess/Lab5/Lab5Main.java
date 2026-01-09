@@ -8,7 +8,6 @@ public class Lab5Main {
         System.out.println("Метод Монте-Карло");
         System.out.println("=".repeat(60));
 
-        // Запуск всех задач
         Task1 task1 = new Task1();
         Task2 task2 = new Task2();
         Task3 task3 = new Task3();

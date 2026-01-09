@@ -126,7 +126,6 @@ class ArrayDeque {
         return dequeArray[front];
     }
 
-    // Просмотр элемента в конце
     public Integer peekLast() {
         if (isEmpty()) {
             return null;
